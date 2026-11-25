@@ -1,0 +1,323 @@
+#include "alsa/alsa_device.hpp"
+#include "alsa/alsa_capture_worker.hpp"
+#include "buffer/spsc_ring_buffer.hpp"
+
+#include <chrono>
+#include <iostream>
+#include <memory>
+#include <string>
+#include <thread>
+#include <utility>
+#include <vector>
+#include <array>
+#include <atomic>
+#include <algorithm>
+
+struct WorkerEntry
+{
+    std::string name;
+
+    // Ring buffer harus tetap hidup selama worker berjalan.
+    // Urutan deklarasi ini memastikan worker dihancurkan
+    // sebelum ring buffer.
+    std::unique_ptr<usb_independent::AudioRingBuffer> ring_buffer;
+
+    std::unique_ptr<usb_independent::AlsaCaptureWorker> worker;
+
+    uint64_t frames_consumed = 0;
+};
+
+int main()
+{
+    std::cout << "\n";
+    std::cout << "====================================\n";
+    std::cout << "       USB INDEPENDENT ENGINE       \n";
+    std::cout << "====================================\n";
+
+    usb_independent::AlsaDeviceDetector detector;
+    auto devices = detector.scan();
+
+    std::cout << "\nID_PATH LOOKUP TEST\n";
+    std::cout << "------------------------------------\n";
+
+    const std::vector<std::string> test_paths = {
+        "pci-0000:00:14.0-usb-0:1:1.0",
+        "pci-0000:00:14.0-usb-0:2:1.0"};
+
+    for (const auto &path : test_paths)
+    {
+        auto found = detector.findByIdPath(path);
+
+        std::cout << "\nRequested ID_PATH: "
+                  << path << "\n";
+
+        if (found.card_index >= 0)
+        {
+            std::cout << "FOUND\n";
+            std::cout << "ALSA card : "
+                      << found.card_index << "\n";
+            std::cout << "PCM       : "
+                      << found.pcm_device << "\n";
+            std::cout << "Topology  : "
+                      << found.usb_topology << "\n";
+        }
+        else
+        {
+            std::cout << "NOT FOUND\n";
+        }
+    }
+
+    std::cout << "\nMISSING DEVICE LOOKUP TEST\n";
+    std::cout << "------------------------------------\n";
+
+    auto missing = detector.findByIdPath(
+        "pci-0000:00:14.0-usb-0:99:1.0");
+
+    if (missing.card_index < 0)
+    {
+        std::cout << "PASS: Device correctly NOT FOUND\n";
+    }
+    else
+    {
+        std::cout << "FAIL: Unexpected device found\n";
+    }
+
+    std::vector<usb_independent::AlsaDevice> cmedia_devices;
+
+    for (const auto &device : devices)
+    {
+        if (device.is_cmedia && device.has_capture)
+        {
+            cmedia_devices.push_back(device);
+        }
+    }
+
+    std::cout << "\nUSB IDENTITY\n";
+
+    for (const auto &device : cmedia_devices)
+    {
+        std::cout << "\nALSA card : "
+                  << device.card_index << "\n";
+
+        std::cout << "Topology  : "
+                  << device.usb_topology << "\n";
+
+        std::cout << "ID_PATH   : "
+                  << device.id_path << "\n";
+
+        std::cout << "Vendor ID : "
+                  << device.vendor_id << "\n";
+
+        std::cout << "Model ID  : "
+                  << device.model_id << "\n";
+
+        std::cout << "Serial    : "
+                  << device.serial << "\n";
+    }
+
+    std::cout << "\nCM108B DEVICES: "
+              << cmedia_devices.size() << "\n";
+
+    if (cmedia_devices.size() < 2)
+    {
+        std::cerr << "ERROR: Minimum two CM108B devices required.\n";
+        return 1;
+    }
+
+    std::vector<WorkerEntry> workers;
+
+    std::cout << "\nSTARTING ALSA CAPTURE WORKERS\n";
+    std::cout << "------------------------------------\n";
+
+    for (const auto &device : cmedia_devices)
+    {
+
+        const std::string name =
+            "CM108_USB_" + device.usb_topology;
+
+        auto ring_buffer =
+            std::make_unique<usb_independent::AudioRingBuffer>();
+
+        auto worker =
+            std::make_unique<usb_independent::AlsaCaptureWorker>(
+                device.id_path,
+                device.card_index,
+                device.pcm_device,
+                name,
+                *ring_buffer);
+
+        if (!worker->start())
+        {
+            std::cerr << "FAILED: " << name
+                      << ": "
+                      << snd_strerror(worker->lastError())
+                      << "\n";
+
+            for (auto &entry : workers)
+            {
+                entry.worker->stop();
+            }
+
+            return 1;
+        }
+
+        std::cout << "Started: " << name
+                  << " (ALSA card " << device.card_index
+                  << ", PCM " << device.pcm_device << ")\n";
+
+        workers.push_back({name,
+                           std::move(ring_buffer),
+                           std::move(worker)});
+    }
+
+    // Give ALSA workers time to fill their ring buffers.
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(50));
+
+    std::atomic<bool> consumer_stop{false};
+
+    std::thread consumer_thread(
+        [&workers, &consumer_stop]()
+        {
+            constexpr std::size_t PERIOD_SIZE = 128;
+
+            constexpr double SAMPLE_RATE = 48000.0;
+
+            const auto period_duration =
+                std::chrono::duration_cast<
+                    std::chrono::steady_clock::duration>(
+                    std::chrono::duration<double>(
+                        PERIOD_SIZE / SAMPLE_RATE));
+
+            auto next_cycle =
+                std::chrono::steady_clock::now();
+
+            std::array<float, PERIOD_SIZE> audio_buffer{};
+
+            while (!consumer_stop.load())
+            {
+                for (auto &entry : workers)
+                {
+                    const std::size_t frames =
+                        entry.ring_buffer->read(
+                            audio_buffer.data(),
+                            PERIOD_SIZE);
+
+                    entry.frames_consumed += frames;
+
+                    // Clear unused portion after a short read.
+                    std::fill(
+                        audio_buffer.begin() + frames,
+                        audio_buffer.end(),
+                        0.0f);
+                }
+
+                next_cycle += period_duration;
+
+                std::this_thread::sleep_until(next_cycle);
+            }
+        });
+
+    std::cout << "\nSPSC CONSUMER STARTED\n";
+    std::cout << "------------------------------------\n";
+    std::cout << "Sample rate : 48000 Hz\n";
+    std::cout << "Period size : 128 frames\n";
+    std::cout << "Period time : approximately 2.67 ms\n";
+
+    std::cout << "\nHOTPLUG DETECTION TEST\n";
+    std::cout << "------------------------------------\n";
+    std::cout << "Unplug one CM108B, wait, then plug it back.\n\n";
+
+    const std::vector<std::string> monitored_paths = {
+        "pci-0000:00:14.0-usb-0:1:1.0",
+        "pci-0000:00:14.0-usb-0:2:1.0"};
+
+    for (int second = 1; second <= 15; ++second)
+    {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+
+        std::cout << "[T+" << second << "s]\n";
+
+        for (const auto &path : monitored_paths)
+        {
+            auto device = detector.findByIdPath(path);
+
+            std::cout << "  " << path << " : ";
+
+            if (device.card_index >= 0)
+            {
+                std::cout << "FOUND (ALSA card "
+                          << device.card_index << ")\n";
+            }
+            else
+            {
+                std::cout << "NOT FOUND\n";
+            }
+        }
+
+        std::cout << "\n";
+    }
+
+    std::cout << "\nSTOPPING CONSUMER\n";
+    std::cout << "------------------------------------\n";
+
+    consumer_stop.store(true);
+
+    if (consumer_thread.joinable())
+    {
+        consumer_thread.join();
+    }
+
+    std::cout << "\nSTOPPING WORKERS\n";
+    std::cout << "------------------------------------\n";
+
+    for (auto &entry : workers)
+    {
+        entry.worker->stop();
+    }
+
+    std::cout << "\nCAPTURE RESULTS\n";
+    std::cout << "------------------------------------\n";
+
+    for (const auto &entry : workers)
+    {
+
+        std::cout << "\nWorker: " << entry.name << "\n";
+
+        std::cout << "Frames captured: "
+                  << entry.worker->framesCaptured()
+                  << "\n";
+
+        std::cout << "Ring buffer available: "
+                  << entry.ring_buffer->available()
+                  << " / "
+                  << entry.ring_buffer->capacity()
+                  << "\n";
+
+        std::cout << "Ring buffer overrun: "
+                  << entry.ring_buffer->overrunCount()
+                  << " samples\n";
+
+        std::cout << "Expected frames: "
+                  << 48000ULL * 15
+                  << "\n";
+
+        std::cout << "Frames consumed: "
+                  << entry.frames_consumed
+                  << "\n";
+
+        std::cout << "Ring buffer underrun: "
+                  << entry.ring_buffer->underrunCount()
+                  << " samples\n";
+
+        const int error = entry.worker->lastError();
+
+        std::cout << "Last error: "
+                  << (error == 0 ? "NONE" : snd_strerror(error))
+                  << "\n";
+    }
+
+    std::cout << "\nALSA CAPTURE TEST COMPLETE\n";
+
+    return 0;
+}

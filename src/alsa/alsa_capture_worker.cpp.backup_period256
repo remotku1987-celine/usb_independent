@@ -1,0 +1,371 @@
+#include <cstdio>
+#include "alsa/alsa_capture_worker.hpp"
+
+#include <cerrno>
+#include <iostream>
+#include <utility>
+#include <chrono>
+namespace usb_independent
+{
+
+    AlsaCaptureWorker::AlsaCaptureWorker(
+        std::string id_path,
+        int card_index,
+        int pcm_device,
+        std::string name,
+        AudioRingBuffer &ring_buffer)
+        : id_path_(std::move(id_path)),
+          card_index_(card_index),
+          pcm_device_(pcm_device),
+          ring_buffer_(ring_buffer),
+          name_(std::move(name))
+    {
+    }
+
+    bool AlsaCaptureWorker::resolveDevice()
+    {
+        if (id_path_.empty())
+        {
+            return false;
+        }
+
+        AlsaDevice device =
+            detector_.findByIdPath(id_path_);
+
+        if (device.card_index < 0)
+        {
+            return false;
+        }
+
+        card_index_ = device.card_index;
+        pcm_device_ = device.pcm_device;
+
+        return true;
+    }
+
+    bool AlsaCaptureWorker::openPcm()
+    {
+        // Resolve current ALSA card using stable ID_PATH
+        if (!resolveDevice())
+        {
+            return false;
+        }
+
+        const std::string device =
+            "hw:" + std::to_string(card_index_) +
+            "," + std::to_string(pcm_device_);
+
+        int result = snd_pcm_open(
+            &pcm_,
+            device.c_str(),
+            SND_PCM_STREAM_CAPTURE,
+            SND_PCM_NONBLOCK);
+
+        if (result < 0)
+        {
+            last_error_.store(result);
+            pcm_ = nullptr;
+            return false;
+        }
+
+        result = configurePcm();
+
+        if (result < 0)
+        {
+            last_error_.store(result);
+
+            snd_pcm_close(pcm_);
+            pcm_ = nullptr;
+
+            return false;
+        }
+
+        last_error_.store(0);
+
+        return true;
+    }
+
+    AlsaCaptureWorker::~AlsaCaptureWorker()
+    {
+        stop();
+    }
+
+    int AlsaCaptureWorker::configurePcm()
+    {
+        snd_pcm_hw_params_t *params;
+        snd_pcm_hw_params_alloca(&params);
+
+        int result = snd_pcm_hw_params_any(pcm_, params);
+        if (result < 0)
+            return result;
+
+        result = snd_pcm_hw_params_set_access(
+            pcm_, params, SND_PCM_ACCESS_RW_INTERLEAVED);
+        if (result < 0)
+            return result;
+
+        result = snd_pcm_hw_params_set_format(
+            pcm_, params, SND_PCM_FORMAT_S16_LE);
+        if (result < 0)
+            return result;
+
+        result = snd_pcm_hw_params_set_channels(
+            pcm_, params, 1);
+        if (result < 0)
+            return result;
+
+        result = snd_pcm_hw_params_set_rate(
+            pcm_, params, 48000, 0);
+        if (result < 0)
+            return result;
+
+        int direction = 0;
+
+        period_size_ = 256;
+
+        result = snd_pcm_hw_params_set_period_size_near(
+            pcm_, params, &period_size_, &direction);
+        if (result < 0)
+            return result;
+
+        unsigned int periods = 4;
+
+        result = snd_pcm_hw_params_set_periods_near(
+            pcm_, params, &periods, &direction);
+        if (result < 0)
+            return result;
+
+        result = snd_pcm_hw_params(pcm_, params);
+        if (result < 0)
+            return result;
+
+        snd_pcm_uframes_t actual_buffer = 0;
+        snd_pcm_uframes_t actual_period = 0;
+
+        result = snd_pcm_get_params(
+            pcm_, &actual_buffer, &actual_period);
+        if (result < 0)
+            return result;
+
+        std::fprintf(
+            stderr,
+            "[%s] ALSA actual: period=%lu frames (%.2f ms), "
+            "buffer=%lu frames (%.2f ms)\n",
+            name_.c_str(),
+            static_cast<unsigned long>(actual_period),
+            1000.0 * actual_period / 48000.0,
+            static_cast<unsigned long>(actual_buffer),
+            1000.0 * actual_buffer / 48000.0);
+
+        return snd_pcm_prepare(pcm_);
+    }
+
+    bool AlsaCaptureWorker::start()
+    {
+        if (thread_.joinable() || pcm_ != nullptr)
+        {
+            return false;
+        }
+        if (!openPcm())
+        {
+            return false;
+        }
+        stop_requested_.store(false);
+        frames_captured_.store(0);
+        last_error_.store(0);
+        running_.store(true);
+
+        try
+        {
+            thread_ = std::thread(
+                &AlsaCaptureWorker::captureLoop,
+                this);
+        }
+        catch (...)
+        {
+            running_.store(false);
+            snd_pcm_close(pcm_);
+            pcm_ = nullptr;
+            throw;
+        }
+
+        return true;
+    }
+
+    void AlsaCaptureWorker::captureLoop()
+    {
+        std::vector<int16_t> buffer(period_size_);
+        std::vector<float> converted_buffer(period_size_);
+
+        constexpr int WAIT_TIMEOUT_MS = 100;
+        constexpr int RECONNECT_DELAY_MS = 1000;
+
+        while (!stop_requested_.load())
+        {
+            // Open or reconnect PCM
+            if (pcm_ == nullptr)
+            {
+                if (!openPcm())
+                {
+
+                    {
+                        std::unique_lock<std::mutex> lock(wait_mutex_);
+
+                        wait_condition_.wait_for(
+                            lock,
+                            std::chrono::milliseconds(RECONNECT_DELAY_MS),
+                            [this]()
+                            {
+                                return stop_requested_.load();
+                            });
+                    }
+
+                    continue;
+                }
+
+                std::cout << "[" << name_
+                          << "] PCM connected. ALSA card "
+                          << card_index_ << "\n";
+            }
+
+            bool reconnect_required = false;
+
+            while (!stop_requested_.load())
+            {
+                snd_pcm_sframes_t frames = snd_pcm_readi(
+                    pcm_,
+                    buffer.data(),
+                    period_size_);
+
+                if (frames > 0)
+                {
+                    const std::size_t frame_count =
+                        static_cast<std::size_t>(frames);
+
+                    frames_captured_.fetch_add(
+                        static_cast<uint64_t>(frames));
+
+                    // Convert S16_LE to normalized float
+                    for (std::size_t i = 0; i < frame_count; ++i)
+                    {
+                        converted_buffer[i] =
+                            static_cast<float>(buffer[i]) / 32768.0f;
+                    }
+
+                    // Push captured audio into this device's ring buffer.
+                    // If full, remaining samples are dropped and counted
+                    // by the SPSC ring buffer overrun counter.
+                    ring_buffer_.write(
+                        converted_buffer.data(),
+                        frame_count);
+
+                    continue;
+                }
+
+                if (frames == -EAGAIN)
+                {
+                    int wait_result = snd_pcm_wait(
+                        pcm_,
+                        WAIT_TIMEOUT_MS);
+
+                    if (wait_result == 0 ||
+                        wait_result == -EINTR)
+                    {
+                        continue;
+                    }
+
+                    if (wait_result < 0)
+                    {
+                        int result = snd_pcm_recover(
+                            pcm_,
+                            wait_result,
+                            1);
+
+                        if (result < 0)
+                        {
+                            last_error_.store(result);
+                            reconnect_required = true;
+                            break;
+                        }
+                    }
+
+                    continue;
+                }
+
+                if (frames == -EINTR)
+                {
+                    continue;
+                }
+
+                if (frames < 0)
+                {
+                    int result = snd_pcm_recover(
+                        pcm_,
+                        static_cast<int>(frames),
+                        1);
+
+                    if (result < 0)
+                    {
+                        last_error_.store(result);
+                        reconnect_required = true;
+                        break;
+                    }
+                }
+            }
+
+            // Close the old PCM before attempting reconnect
+            if (pcm_ != nullptr)
+            {
+                snd_pcm_close(pcm_);
+                pcm_ = nullptr;
+            }
+
+            if (reconnect_required &&
+                !stop_requested_.load())
+            {
+                std::cout << "[" << name_
+                          << "] PCM disconnected. Error: "
+                          << snd_strerror(last_error_.load())
+                          << ". Retrying...\n";
+            }
+        }
+
+        if (pcm_ != nullptr)
+        {
+            snd_pcm_close(pcm_);
+            pcm_ = nullptr;
+        }
+
+        running_.store(false);
+    }
+
+    void AlsaCaptureWorker::stop()
+    {
+        stop_requested_.store(true);
+
+        wait_condition_.notify_all();
+
+        if (thread_.joinable())
+        {
+            thread_.join();
+        }
+
+        running_.store(false);
+    }
+
+    bool AlsaCaptureWorker::isRunning() const
+    {
+        return running_.load();
+    }
+
+    uint64_t AlsaCaptureWorker::framesCaptured() const
+    {
+        return frames_captured_.load();
+    }
+
+    int AlsaCaptureWorker::lastError() const
+    {
+        return last_error_.load();
+    }
+
+}

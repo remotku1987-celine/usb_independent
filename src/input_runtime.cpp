@@ -1,0 +1,451 @@
+#include "alsa/alsa_device.hpp"
+#include "alsa/alsa_capture_worker.hpp"
+#include "asrc/asrc_worker.hpp"
+#include "buffer/spsc_ring_buffer.hpp"
+#include "jack/jack_output.hpp"
+
+#include <atomic>
+#include <chrono>
+#include <csignal>
+#include <cstdint>
+#include <iostream>
+#include <memory>
+#include <string>
+#include <thread>
+#include <utility>
+#include <vector>
+
+using namespace usb_independent;
+
+namespace
+{
+    volatile std::sig_atomic_t stop_requested = 0;
+
+    void handleSignal(int)
+    {
+        stop_requested = 1;
+    }
+
+    struct DevicePipeline
+    {
+        std::string name;
+        std::string id_path;
+
+        // Buffer harus hidup lebih lama daripada worker.
+        std::unique_ptr<AudioRingBuffer> input_buffer;
+        std::unique_ptr<AudioRingBuffer> output_buffer;
+
+        std::unique_ptr<AlsaCaptureWorker> capture_worker;
+        std::unique_ptr<AsrcWorker> asrc_worker;
+    };
+
+    void shutdownPipelines(
+        std::vector<DevicePipeline> &pipelines,
+        JackOutput &jack_output)
+    {
+        std::cout << "\nStopping ALSA capture workers...\n";
+
+        for (auto &pipeline : pipelines)
+        {
+            if (pipeline.capture_worker)
+                pipeline.capture_worker->stop();
+        }
+
+        std::cout << "Stopping ASRC workers and draining output...\n";
+
+        for (auto &pipeline : pipelines)
+        {
+            if (pipeline.asrc_worker)
+                pipeline.asrc_worker->stop();
+        }
+
+        // JACK tetap aktif selama output buffer dikosongkan.
+        const auto deadline =
+            std::chrono::steady_clock::now() +
+            std::chrono::seconds(3);
+
+        while (std::chrono::steady_clock::now() < deadline)
+        {
+            bool all_empty = true;
+
+            for (const auto &pipeline : pipelines)
+            {
+                if (pipeline.output_buffer &&
+                    pipeline.output_buffer->available() != 0)
+                {
+                    all_empty = false;
+                    break;
+                }
+            }
+
+            if (all_empty || jack_output.serverShutdown())
+                break;
+
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(10));
+        }
+
+        for (const auto &pipeline : pipelines)
+        {
+            if (pipeline.output_buffer &&
+                pipeline.output_buffer->available() != 0)
+            {
+                std::cerr
+                    << "WARNING: Output buffer masih berisi "
+                    << pipeline.output_buffer->available()
+                    << " frames untuk "
+                    << pipeline.name << "\n";
+            }
+        }
+
+        std::cout << "Closing JACK...\n";
+        jack_output.close();
+
+        // Statistik output buffer setelah JACK berhenti membaca buffer.
+        std::cout << "\nOUTPUT BUFFER STATISTICS\n";
+        std::cout << "------------------------------------\n";
+
+        for (const auto &pipeline : pipelines)
+        {
+            if (!pipeline.output_buffer)
+                continue;
+
+            std::cout << "\nDevice: "
+                      << pipeline.name << "\n";
+
+            std::cout << "Available frames: "
+                      << pipeline.output_buffer->available()
+                      << " / "
+                      << pipeline.output_buffer->capacity()
+                      << "\n";
+
+            std::cout << "Underrun frames: "
+                      << pipeline.output_buffer->underrunCount()
+                      << "\n";
+
+            std::cout << "Underrun events: "
+                      << pipeline.output_buffer->underrunEventCount()
+                      << "\n";
+
+            std::cout << "Overrun frames: "
+                      << pipeline.output_buffer->overrunCount()
+                      << "\n";
+        }
+
+        std::cout << "\nASRC TELEMETRY STATISTICS\n";
+        std::cout << "------------------------------------\n";
+
+        for (const auto &pipeline : pipelines)
+        {
+            if (!pipeline.asrc_worker)
+                continue;
+
+            const AsrcTelemetry telemetry =
+                pipeline.asrc_worker->telemetry();
+
+            std::cout << "\nDevice: "
+                      << pipeline.name << "\n";
+
+            std::cout << "Frames consumed: "
+                      << pipeline.asrc_worker->framesConsumed()
+                      << "\n";
+
+            std::cout << "Frames generated: "
+                      << pipeline.asrc_worker->framesGenerated()
+                      << "\n";
+
+            std::cout << "Ratio: "
+                      << telemetry.ratio << "\n";
+
+            std::cout << "Correction (ppm): "
+                      << telemetry.correction_ppm << "\n";
+
+            std::cout << "Filtered occupancy: "
+                      << telemetry.filtered_occupancy << "\n";
+
+            std::cout << "Minimum occupancy: "
+                      << telemetry.min_occupancy << "\n";
+
+            std::cout << "Maximum occupancy: "
+                      << telemetry.max_occupancy << "\n";
+
+            std::cout << "Average occupancy: "
+                      << telemetry.average_occupancy << "\n";
+
+            std::cout << "Controller updates: "
+                      << telemetry.controller_updates << "\n";
+
+            std::cout << "Last error: "
+                      << pipeline.asrc_worker->lastError()
+                      << "\n";
+        }
+
+        std::cout << "\nRuntime stopped.\n";
+    }
+}
+
+int main()
+{
+    const std::vector<std::string> required_paths = {
+        "pci-0000:00:14.0-usb-0:1:1.0",
+        "pci-0000:00:14.0-usb-0:2:1.0"};
+
+    std::signal(SIGINT, handleSignal);
+    std::signal(SIGTERM, handleSignal);
+
+    std::cout
+        << "\n========================================\n"
+        << " USB INDEPENDENT INPUT RUNTIME\n"
+        << "========================================\n";
+
+    AlsaDeviceDetector detector;
+    std::vector<DevicePipeline> pipelines;
+    pipelines.reserve(required_paths.size());
+
+    // 1. Temukan dua perangkat fisik berdasarkan ID_PATH.
+    for (std::size_t i = 0; i < required_paths.size(); ++i)
+    {
+        const auto device = detector.findByIdPath(required_paths[i]);
+
+        if (device.card_index < 0 || !device.has_capture)
+        {
+            std::cerr
+                << "ERROR: Capture device tidak ditemukan:\n"
+                << required_paths[i] << "\n";
+
+            return 1;
+        }
+
+        DevicePipeline pipeline;
+
+        pipeline.name =
+            "CM108_INPUT_0" + std::to_string(i + 1);
+
+        pipeline.id_path = required_paths[i];
+
+        pipeline.input_buffer =
+            std::make_unique<AudioRingBuffer>();
+
+        pipeline.output_buffer =
+            std::make_unique<AudioRingBuffer>();
+
+        pipeline.capture_worker =
+            std::make_unique<AlsaCaptureWorker>(
+                device.id_path,
+                device.card_index,
+                device.pcm_device,
+                pipeline.name,
+                *pipeline.input_buffer);
+
+        pipeline.asrc_worker =
+            std::make_unique<AsrcWorker>(
+                *pipeline.input_buffer,
+                *pipeline.output_buffer);
+
+        std::cout
+            << "\nDevice: " << pipeline.name
+            << "\nALSA card: " << device.card_index
+            << "\nID_PATH: " << device.id_path
+            << "\n";
+
+        pipelines.push_back(std::move(pipeline));
+    }
+
+    // 2. Buka JACK dan daftarkan output.
+    JackOutput jack_output;
+
+    if (!jack_output.open("usb_independent"))
+    {
+        std::cerr << "ERROR: Tidak dapat membuka JACK client.\n";
+        return 1;
+    }
+
+    for (auto &pipeline : pipelines)
+    {
+        if (!jack_output.addOutputPort(
+                pipeline.name,
+                *pipeline.output_buffer))
+        {
+            std::cerr
+                << "ERROR: Gagal mendaftarkan JACK port: "
+                << pipeline.name << "\n";
+
+            shutdownPipelines(pipelines, jack_output);
+            return 1;
+        }
+
+        std::cout
+            << "JACK output tersedia: usb_independent:"
+            << pipeline.name << "\n";
+    }
+
+    // 3. Mulai ASRC terlebih dahulu.
+    for (auto &pipeline : pipelines)
+    {
+        if (!pipeline.asrc_worker->start())
+        {
+            std::cerr
+                << "ERROR: Gagal memulai ASRC: "
+                << pipeline.name << "\n";
+
+            shutdownPipelines(pipelines, jack_output);
+            return 1;
+        }
+
+        std::cout << "ASRC started: " << pipeline.name << "\n";
+    }
+
+    // 4. Mulai ALSA capture.
+    for (auto &pipeline : pipelines)
+    {
+        if (!pipeline.capture_worker->start())
+        {
+            std::cerr
+                << "ERROR: Gagal memulai ALSA capture: "
+                << pipeline.name << "\n";
+
+            shutdownPipelines(pipelines, jack_output);
+            return 1;
+        }
+
+        std::cout << "ALSA capture started: "
+                  << pipeline.name << "\n";
+    }
+
+    // 5. Tunggu kedua output buffer siap sebelum JACK aktif.
+    constexpr std::size_t STARTUP_TARGET_FRAMES = 512;
+    constexpr auto STARTUP_TIMEOUT =
+        std::chrono::seconds(5);
+
+    const auto startup_deadline =
+        std::chrono::steady_clock::now() + STARTUP_TIMEOUT;
+
+    bool startup_ready = false;
+
+    std::cout
+        << "\nWaiting for both ASRC output buffers..."
+        << "\nRequired occupancy: "
+        << STARTUP_TARGET_FRAMES << " frames per device"
+        << "\n";
+
+    while (std::chrono::steady_clock::now() < startup_deadline)
+    {
+        if (stop_requested || jack_output.serverShutdown())
+        {
+            std::cerr
+                << "ERROR: Startup dibatalkan sebelum JACK aktif.\n";
+
+            shutdownPipelines(pipelines, jack_output);
+            return 1;
+        }
+
+        bool workers_healthy = true;
+        bool all_buffers_ready = true;
+
+        for (const auto &pipeline : pipelines)
+        {
+            if (!pipeline.capture_worker->isRunning())
+            {
+                std::cerr
+                    << "ERROR: ALSA capture worker berhenti: "
+                    << pipeline.name
+                    << ", error: "
+                    << pipeline.capture_worker->lastError()
+                    << "\n";
+
+                workers_healthy = false;
+                break;
+            }
+
+            if (!pipeline.asrc_worker->isRunning() ||
+                pipeline.asrc_worker->lastError() != 0)
+            {
+                std::cerr
+                    << "ERROR: ASRC worker gagal: "
+                    << pipeline.name
+                    << ", error: "
+                    << pipeline.asrc_worker->lastError()
+                    << "\n";
+
+                workers_healthy = false;
+                break;
+            }
+
+            if (pipeline.output_buffer->available() <
+                STARTUP_TARGET_FRAMES)
+            {
+                all_buffers_ready = false;
+            }
+        }
+
+        if (!workers_healthy)
+        {
+            shutdownPipelines(pipelines, jack_output);
+            return 1;
+        }
+
+        if (all_buffers_ready)
+        {
+            startup_ready = true;
+            break;
+        }
+
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(1));
+    }
+
+    if (!startup_ready)
+    {
+        std::cerr
+            << "ERROR: Startup timeout setelah 5 detik.\n";
+
+        for (const auto &pipeline : pipelines)
+        {
+            std::cerr
+                << pipeline.name
+                << " output occupancy: "
+                << pipeline.output_buffer->available()
+                << " / "
+                << STARTUP_TARGET_FRAMES
+                << " frames\n";
+        }
+
+        shutdownPipelines(pipelines, jack_output);
+        return 1;
+    }
+
+    std::cout
+        << "Both ASRC output buffers are ready.\n";
+
+    // 6. JACK baru aktif setelah kedua jalur siap.
+    if (!jack_output.activate())
+    {
+        std::cerr << "ERROR: Gagal mengaktifkan JACK.\n";
+        shutdownPipelines(pipelines, jack_output);
+        return 1;
+    }
+
+    std::cout << "JACK activated.\\n";
+
+    std::cout
+        << "\nUSB Independent sedang berjalan.\n"
+        << "JACK client : usb_independent\n"
+        << "Output 1    : CM108_INPUT_01\n"
+        << "Output 2    : CM108_INPUT_02\n"
+        << "Tekan Ctrl+C untuk berhenti.\n\n";
+
+    // 5. Runtime berjalan sampai ada sinyal berhenti
+    // atau JACK server mengalami shutdown.
+    while (!stop_requested && !jack_output.serverShutdown())
+    {
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(100));
+    }
+
+    if (jack_output.serverShutdown())
+        std::cerr << "\nWARNING: JACK server shutdown.\n";
+
+    shutdownPipelines(pipelines, jack_output);
+
+    return 0;
+}

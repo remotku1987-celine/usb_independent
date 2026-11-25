@@ -1,0 +1,176 @@
+
+#pragma once
+
+#include <array>
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <type_traits>
+
+namespace usb_independent
+{
+
+    template <typename T, std::size_t Capacity>
+    class SpscRingBuffer
+    {
+        static_assert(Capacity > 0,
+                      "Capacity must be greater than zero");
+
+        static_assert((Capacity & (Capacity - 1)) == 0,
+                      "Capacity must be a power of two");
+
+        static_assert(std::is_trivially_copyable<T>::value,
+                      "T must be trivially copyable");
+
+        static_assert(
+            std::atomic<std::size_t>::is_always_lock_free,
+            "Atomic size_t must be lock-free");
+
+        static_assert(
+            std::atomic<std::uint64_t>::is_always_lock_free,
+            "Atomic uint64_t must be lock-free");
+
+    public:
+        SpscRingBuffer() = default;
+
+        SpscRingBuffer(const SpscRingBuffer &) = delete;
+        SpscRingBuffer &operator=(const SpscRingBuffer &) = delete;
+
+        std::size_t write(
+            const T *source,
+            std::size_t count) noexcept
+        {
+            if (source == nullptr || count == 0)
+                return 0;
+
+            const std::size_t write_pos =
+                write_index_.load(std::memory_order_relaxed);
+
+            const std::size_t read_pos =
+                read_index_.load(std::memory_order_acquire);
+
+            const std::size_t used =
+                write_pos - read_pos;
+
+            const std::size_t available =
+                Capacity - used;
+
+            const std::size_t to_write =
+                count < available ? count : available;
+
+            for (std::size_t i = 0; i < to_write; ++i)
+            {
+                buffer_[(write_pos + i) & MASK] = source[i];
+            }
+
+            write_index_.store(
+                write_pos + to_write,
+                std::memory_order_release);
+
+            if (to_write < count)
+            {
+                overrun_count_.fetch_add(
+                    count - to_write,
+                    std::memory_order_relaxed);
+            }
+
+            return to_write;
+        }
+
+        std::size_t read(
+            T *destination,
+            std::size_t count) noexcept
+        {
+            if (destination == nullptr || count == 0)
+                return 0;
+
+            const std::size_t read_pos =
+                read_index_.load(std::memory_order_relaxed);
+
+            const std::size_t write_pos =
+                write_index_.load(std::memory_order_acquire);
+
+            const std::size_t available =
+                write_pos - read_pos;
+
+            const std::size_t to_read =
+                count < available ? count : available;
+
+            for (std::size_t i = 0; i < to_read; ++i)
+            {
+                destination[i] =
+                    buffer_[(read_pos + i) & MASK];
+            }
+
+            read_index_.store(
+                read_pos + to_read,
+                std::memory_order_release);
+
+            if (to_read < count)
+            {
+                underrun_count_.fetch_add(
+                    count - to_read,
+                    std::memory_order_relaxed);
+
+                underrun_events_.fetch_add(
+                    1,
+                    std::memory_order_relaxed);
+            }
+
+            return to_read;
+        }
+
+        std::size_t available() const noexcept
+        {
+            const std::size_t write_pos =
+                write_index_.load(std::memory_order_acquire);
+
+            const std::size_t read_pos =
+                read_index_.load(std::memory_order_acquire);
+
+            return write_pos - read_pos;
+        }
+
+        std::size_t freeSpace() const noexcept
+        {
+            return Capacity - available();
+        }
+
+        constexpr std::size_t capacity() const noexcept
+        {
+            return Capacity;
+        }
+
+        std::uint64_t overrunCount() const noexcept
+        {
+            return overrun_count_.load(
+                std::memory_order_relaxed);
+        }
+
+        std::uint64_t underrunCount() const noexcept
+        {
+            return underrun_count_.load(
+                std::memory_order_relaxed);
+        }
+
+        std::uint64_t underrunEventCount() const noexcept
+        {
+            return underrun_events_.load(
+                std::memory_order_relaxed);
+        }
+
+    private:
+        static constexpr std::size_t MASK = Capacity - 1;
+
+        alignas(64) std::array<T, Capacity> buffer_{};
+
+        alignas(64) std::atomic<std::size_t> write_index_{0};
+        alignas(64) std::atomic<std::size_t> read_index_{0};
+        alignas(64) std::atomic<std::uint64_t> overrun_count_{0};
+        alignas(64) std::atomic<std::uint64_t> underrun_count_{0};
+        alignas(64) std::atomic<std::uint64_t> underrun_events_{0};
+    };
+
+    using AudioRingBuffer = SpscRingBuffer<float, 8192>;
+
+}
